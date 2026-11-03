@@ -1,0 +1,209 @@
+#!/usr/bin/python3
+"""Backlight control without suspending Linux or changing network services.
+
+nds-screen-off                         Blank now; exit on touch/key input.
+nds-screen-off --start --idle-minutes 30  Start a detached repeating idle timer.
+nds-screen-off --wake                  Restore brightness and reset idle timer.
+nds-screen-off --stop                  Stop the listener and restore brightness.
+nds-screen-off --status                Print current listener status.
+
+Apps entries enable the 30-minute timer or disable it. No boot service is installed.
+Input is observed without grabbing devices; waking input also reaches applications.
+Power/sleep keys retain their existing behavior and are excluded from wake handling.
+"""
+import argparse
+import fcntl
+import glob
+import json
+import math
+import os
+from pathlib import Path
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+LOCK = '/tmp/nds-screen-off.lock'
+LOG = '/tmp/nds-screen-off.log'
+EVENT = struct.Struct('@llHHi')
+
+
+def is_activity(kind, code, value, touchscreen=False):
+    if kind == 1:
+        return value in (0, 1, 2) and code not in (116, 142, 205)
+    return touchscreen and kind == 3 and code in (0, 1, 53, 54, 57)
+
+
+def is_wake(kind, code, value, touchscreen=False):
+    return (kind == 1 and value in (1, 2) and code not in (116, 142, 205)
+            or touchscreen and kind == 3 and code in (0, 1, 53, 54, 57)
+            and not (code == 57 and value < 0))
+
+
+def touch_device(fd):
+    bits = bytearray(96)
+    # EVIOCGBIT(EV_KEY): detect BTN_TOUCH without relying on event node numbering.
+    fcntl.ioctl(fd, 0x80000000 | (len(bits) << 16) | (ord('E') << 8) | 0x21, bits)
+    return bool(bits[330 // 8] & (1 << (330 % 8)))
+
+
+class Backlights:
+    def __init__(self, paths):
+        self.paths = paths
+        self.saved = None
+
+    def blank(self):
+        self.saved = [(p, p.read_text().strip()) for p in self.paths]
+        if not any(int(value) for _, value in self.saved):
+            self.saved = None
+            raise RuntimeError('Backlights already off; restore brightness first.')
+        for path, _ in self.saved:
+            path.write_text('0\n')
+        print('Backlights off.', flush=True)
+
+    def restore(self):
+        if self.saved is None:
+            return
+        errors = []
+        for path, value in self.saved:
+            try:
+                path.write_text(value + '\n')
+            except OSError as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError('; '.join(errors))
+        self.saved = None
+        print('Backlights restored.', flush=True)
+
+
+def run_loop(inputs, lights, idle_seconds, requests):
+    last_activity = time.monotonic()
+    try:
+        if idle_seconds is None:
+            lights.blank()
+        print('Listener ready.', flush=True)
+        while not requests['stop']:
+            if requests['wake']:
+                requests['wake'] = False
+                lights.restore()
+                last_activity = time.monotonic()
+                if idle_seconds is None:
+                    return
+            timeout = 0.25
+            if lights.saved is None and idle_seconds is not None:
+                timeout = min(timeout, max(0, last_activity + idle_seconds - time.monotonic()))
+            ready, _, _ = select.select(list(inputs), [], [], timeout)
+            for fd in ready:
+                try:
+                    data = os.read(fd, EVENT.size * 64)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    raise RuntimeError('Input device disconnected; stopping safely.')
+                for _, _, kind, code, value in EVENT.iter_unpack(data):
+                    if is_activity(kind, code, value, inputs[fd]):
+                        last_activity = time.monotonic()
+                    if lights.saved is not None and is_wake(kind, code, value, inputs[fd]):
+                        lights.restore()
+                        last_activity = time.monotonic()
+                        if idle_seconds is None:
+                            return
+            if (not requests['stop'] and lights.saved is None and idle_seconds is not None
+                    and time.monotonic() - last_activity >= idle_seconds):
+                lights.blank()
+    finally:
+        lights.restore()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--start', action='store_true')
+    action.add_argument('--wake', action='store_true')
+    action.add_argument('--stop', action='store_true')
+    action.add_argument('--status', action='store_true')
+    parser.add_argument('--idle-minutes', type=float)
+    args = parser.parse_args()
+    if args.idle_minutes is not None and (not math.isfinite(args.idle_minutes) or args.idle_minutes <= 0):
+        parser.error('--idle-minutes must be positive and finite')
+    if args.start:
+        minutes = args.idle_minutes if args.idle_minutes is not None else 30
+        with open(LOG, 'a') as log:
+            child = subprocess.Popen([sys.executable, os.path.realpath(__file__), '--idle-minutes', str(minutes)],
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                     start_new_session=True, close_fds=True)
+        # Wait for readiness without tying daemon lifetime to the launching menu.
+        for _ in range(100):
+            if child.poll() is not None:
+                if child.returncode:
+                    raise SystemExit(f'Cannot start listener; see {LOG}')
+                return
+            try:
+                with open(LOCK) as state:
+                    info = json.load(state)
+                if isinstance(info, dict) and info.get('pid') == child.pid:
+                    print(f'Idle timer enabled: {minutes:g} minutes.', flush=True)
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.05)
+        child.terminate()
+        child.wait(timeout=5)
+        raise SystemExit('Listener startup timed out.')
+    with open(LOCK, 'a+') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            info = json.load(lock)
+            if args.wake or args.stop:
+                os.kill(info['pid'], signal.SIGUSR1 if args.wake else signal.SIGTERM)
+                if args.stop:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                print('Stopped.' if args.stop else 'Wake requested.', flush=True)
+            elif args.status:
+                print(json.dumps(info, ensure_ascii=False), flush=True)
+            elif args.idle_minutes == info.get('idle_minutes'):
+                print('Idle timer is already enabled.', flush=True)
+            else:
+                raise SystemExit('Another listener is running; stop it before changing mode.')
+            return
+        if args.wake or args.stop or args.status:
+            print('No screen-off listener is running.', flush=True)
+            return
+        requests = {'stop': False, 'wake': False}
+        def request(signum, frame):
+            requests['wake' if signum == signal.SIGUSR1 else 'stop'] = True
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+            signal.signal(sig, request)
+        inputs = {}
+        paths = [Path(p) / 'brightness' for p in sorted(glob.glob('/sys/class/backlight/*'))]
+        if not paths:
+            raise RuntimeError('No backlights found.')
+        try:
+            for name in sorted(glob.glob('/dev/input/event*')):
+                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK)
+                inputs[fd] = touch_device(fd)
+                while True:
+                    try:
+                        if not os.read(fd, EVENT.size * 64):
+                            raise RuntimeError('Input device disconnected.')
+                    except BlockingIOError:
+                        break
+            if not inputs:
+                raise RuntimeError('No input devices available.')
+            lock.seek(0)
+            lock.truncate()
+            json.dump({'pid': os.getpid(), 'idle_minutes': args.idle_minutes}, lock)
+            lock.flush()
+            seconds = None if args.idle_minutes is None else args.idle_minutes * 60
+            run_loop(inputs, Backlights(paths), seconds, requests)
+        finally:
+            for fd in inputs:
+                os.close(fd)
+
+
+if __name__ == '__main__':
+    main()
